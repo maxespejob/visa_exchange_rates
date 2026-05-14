@@ -1,53 +1,41 @@
-# =============================================================================
-# AWS LAMBDA - VISA Exchange Rates
-# Patrón Fan-out: una sola función, dos roles
-#
-# Modo ORCHESTRATOR:
-#   - Obtiene lista de monedas
-#   - Divide los pares en chunks
-#   - Invoca N workers en paralelo (async)
-#   - Cada worker guarda su resultado en S3
-#
-# Modo WORKER:
-#   - Recibe un chunk de pares
-#   - Scrapea con Playwright
-#   - Guarda JSON en S3
-#
-# VARIABLES DE ENTORNO:
-#   S3_BUCKET      → nombre del bucket
-#   S3_PREFIX      → prefijo (ej: raw/visa/)
-#   FUNCTION_NAME  → nombre de esta misma función Lambda (para auto-invocarse)
-#
-# EVENTOS DE ENTRADA:
-#   Orquestadora: {"mode": "orchestrator", "begin_date": "2025-07-01", "end_date": "2025-07-01"}
-#   Worker:       {"mode": "worker", "fecha": "07/01/2025", "pairs": [...], "chunk_id": 1}
-#
-# PERMISOS IAM ADICIONALES NECESARIOS:
-#   lambda:InvokeFunction sobre esta misma función
-# =============================================================================
-
 import asyncio
+import io
 import json
+import logging
 import os
 import random
 from datetime import datetime, timedelta
-from decimal import Decimal
 
 import boto3
+import pyarrow as pa
+import pyarrow.parquet as pq
+import urllib.request
 from bs4 import BeautifulSoup
 
 # =============================================================================
-# CONFIGURACIÓN
+# LOGGING
 # =============================================================================
 
-EXCHANGE_TABLE = os.environ.get("EXCHANGE_TABLE", "visa_exchange_rates")
-FUNCTION_NAME = os.environ.get("FUNCTION_NAME", "visa-exchange-rates-scraper")
-BEGIN_DATE    = os.environ.get("BEGIN_DATE",    datetime.utcnow().strftime("%Y-%m-%d"))
-END_DATE      = os.environ.get("END_DATE",      datetime.utcnow().strftime("%Y-%m-%d"))
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
-CONCURRENCIA  = 8
-TIMEOUT_MS    = 12000
-NUM_CHUNKS    = 12       # workers en paralelo → 28056 / 6 ≈ 4676 pares c/u
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+S3_BUCKET     = os.environ.get("S3_BUCKET",     "itl-0004-itx-dev-poc-02-reference")
+S3_PREFIX     = os.environ.get("S3_PREFIX",     "exchange-rates/brand=Visa")
+FUNCTION_NAME = os.environ.get("FUNCTION_NAME", "itl-0004-itx-dev-visa-exchange-rates")
+BEGIN_DATE    = os.environ.get("BEGIN_DATE",     datetime.now().strftime("%Y-%m-%d"))
+END_DATE      = os.environ.get("END_DATE",       datetime.now().strftime("%Y-%m-%d"))
+
+NUM_CHUNKS   = 12
+CONCURRENCY  = 8
+TIMEOUT_MS   = 12000
+
+DATE_FORMAT_INPUT  = "%Y-%m-%d"
+DATE_FORMAT_OUTPUT = "%m/%d/%Y"
+DATE_FORMAT_FILE   = "%Y%m%d"
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
@@ -56,7 +44,7 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.91 Safari/537.36",
 ]
 
-EXTRA_HEADERS = {
+REQUEST_HEADERS = {
     "Referer":         "https://www.visa.com.pe/",
     "Accept":          "application/json, text/plain, */*",
     "Accept-Language": "es-PE,es;q=0.9,en;q=0.8",
@@ -69,121 +57,182 @@ VISA_CALCULATOR_URL = (
 VISA_RATES_URL = (
     "https://www.visa.com.pe/cmsapi/fx/rates?"
     "amount=1&fee=0"
-    "&utcConvertedDate={fecha}"
-    "&exchangedate={fecha}"
-    "&fromCurr={to_curr}"
-    "&toCurr={from_curr}"
+    "&utcConvertedDate={date}"
+    "&exchangedate={date}"
+    "&fromCurr={to_currency}"
+    "&toCurr={from_currency}"
 )
 
-
 # =============================================================================
-# HELPERS COMPARTIDOS
-# =============================================================================
-
-def generate_dates_range(begin_date_str: str, end_date_str: str) -> list[str]:
-    begin = datetime.strptime(begin_date_str, "%Y-%m-%d")
-    end   = datetime.strptime(end_date_str,   "%Y-%m-%d")
-    return [
-        (begin + timedelta(days=i)).strftime("%m/%d/%Y")
-        for i in range((end - begin).days + 1)
-    ]
-
-
-def get_visa_currency_list() -> list[list[str]]:
-    import urllib.request
-    with urllib.request.urlopen(VISA_CALCULATOR_URL, timeout=15) as resp:
-        html = resp.read().decode("utf-8")
-
-    body       = BeautifulSoup(html, "html.parser")
-    calculator = body.find("dm-calculator")
-    data       = json.loads(calculator.get("content"))
-
-    keys = [c["key"] for c in data["currencyList"] if c["key"] != "None"]
-    keys.append("SLE")
-
-    pairs = [[c1, c2] for c1 in keys for c2 in keys if c1 != c2]
-    print(f"[get_visa_currency_list] {len(keys)} monedas → {len(pairs)} pares")
-    return pairs
-
-
-def split_into_chunks(lst: list, n: int) -> list[list]:
-    size = len(lst) // n
-    return [lst[i * size:(i + 1) * size] if i < n - 1 else lst[i * size:] for i in range(n)]
-
-def save_to_dynamodb(records: list[dict]) -> tuple[int, int]:
-    dynamodb = boto3.resource("dynamodb")
-    table    = dynamodb.Table(EXCHANGE_TABLE)
-
-    written = 0
-    skipped = 0
-
-    with table.batch_writer() as batch:
-        for r in records:
-            if r["fxRate"] == "":
-                skipped += 1
-                continue
-            batch.put_item(Item={
-                "date":          r["date"],
-                "currency_pair": f"{r['fromCurrency']}#{r['toCurrency']}",
-                "fx_rate":       Decimal(str(r["fxRate"])),
-            })
-            written += 1
-
-    print(f"[save_to_dynamodb] ✅ escritos={written} | omitidos={skipped}")
-    return written, skipped
-# =============================================================================
-# ROL ORQUESTADORA
+# HELPERS
 # =============================================================================
 
-def run_orchestrator(begin_date: str, end_date: str):
-    print(f"[ORCHESTRATOR] Iniciando | begin={begin_date} | end={end_date}")
+def generate_date_range(begin_date_str: str, end_date_str: str) -> list[str]:
+    """Returns a list of dates in MM/DD/YYYY format between two YYYY-MM-DD dates."""
+    try:
+        begin = datetime.strptime(begin_date_str, DATE_FORMAT_INPUT)
+        end   = datetime.strptime(end_date_str,   DATE_FORMAT_INPUT)
+        dates = [
+            (begin + timedelta(days=i)).strftime(DATE_FORMAT_OUTPUT)
+            for i in range((end - begin).days + 1)
+        ]
+        logger.info(f"[generate_date_range] {len(dates)} date(s) generated: {dates[0]} -> {dates[-1]}")
+        return dates
+    except ValueError as e:
+        logger.error(f"[generate_date_range] Invalid date format: {e}")
+        raise
 
-    dates  = generate_dates_range(begin_date, end_date)
-    pairs  = get_visa_currency_list()
-    chunks = split_into_chunks(pairs, NUM_CHUNKS)
 
-    lambda_client = boto3.client("lambda")
+def split_into_chunks(items: list, num_chunks: int) -> list[list]:
+    """Splits a list into N roughly equal chunks."""
+    try:
+        chunk_size = len(items) // num_chunks
+        chunks = [
+            items[i * chunk_size:(i + 1) * chunk_size] if i < num_chunks - 1
+            else items[i * chunk_size:]
+            for i in range(num_chunks)
+        ]
+        logger.info(f"[split_into_chunks] {len(items)} items split into {num_chunks} chunks (~{chunk_size} each)")
+        return chunks
+    except Exception as e:
+        logger.error(f"[split_into_chunks] Failed to split list: {e}")
+        raise
 
-    for fecha in dates:
-        print(f"[ORCHESTRATOR] Invocando {NUM_CHUNKS} workers para {fecha}...")
 
-        for chunk_id, chunk in enumerate(chunks, start=1):
-            payload = {
-                "mode":     "worker",
-                "fecha":    fecha,
-                "pairs":    chunk,
-                "chunk_id": chunk_id,
-            }
-            response = lambda_client.invoke(
-                FunctionName=FUNCTION_NAME,
-                InvocationType="Event",   # async — no espera respuesta
-                Payload=json.dumps(payload),
-            )
-            print(f"[ORCHESTRATOR] Worker {chunk_id} invocado | {len(chunk)} pares | status={response['StatusCode']}")
+def fetch_currency_list() -> list[list[str]]:
+    """
+    Fetches the supported currency list from the VISA calculator page
+    and returns all valid currency pairs.
+    """
+    logger.info("[fetch_currency_list] Fetching supported currencies from VISA...")
 
-    print(f"[ORCHESTRATOR] ✅ {NUM_CHUNKS * len(dates)} workers lanzados")
-    return {
-        "statusCode":  200,
-        "mode":        "orchestrator",
-        "workers":     NUM_CHUNKS * len(dates),
-        "total_pairs": len(pairs),
-        "dates":       dates,
-    }
+    try:
+        with urllib.request.urlopen(VISA_CALCULATOR_URL, timeout=15) as response:
+            html = response.read().decode("utf-8")
 
+        body       = BeautifulSoup(html, "html.parser")
+        calculator = body.find("dm-calculator")
+        data       = json.loads(calculator.get("content"))
+
+        currencies = [c["key"] for c in data["currencyList"] if c["key"] != "None"]
+        currencies.append("SLE")
+
+        pairs = [[src, dst] for src in currencies for dst in currencies if src != dst]
+        logger.info(f"[fetch_currency_list] {len(currencies)} currencies -> {len(pairs)} pairs")
+        return pairs
+
+    except urllib.error.URLError as e:
+        logger.error(f"[fetch_currency_list] Failed to reach VISA calculator page: {e}")
+        raise
+    except (AttributeError, KeyError, json.JSONDecodeError) as e:
+        logger.error(f"[fetch_currency_list] Failed to parse currency list: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"[fetch_currency_list] Unexpected error: {e}")
+        raise
+
+
+def delete_existing_parquets(date_str: str) -> int:
+    """
+    Deletes all parquet files under the S3 prefix for a given date.
+    Used to clean up stale files before reprocessing.
+    Returns the number of deleted objects.
+    """
+    prefix = f"{S3_PREFIX}/exchange_date={date_str}/"
+
+    try:
+        s3       = boto3.client("s3")
+        response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
+        objects  = response.get("Contents", [])
+
+        if not objects:
+            logger.info(f"[delete_existing_parquets] No existing files found at s3://{S3_BUCKET}/{prefix}")
+            return 0
+
+        delete_payload = {"Objects": [{"Key": obj["Key"]} for obj in objects]}
+        s3.delete_objects(Bucket=S3_BUCKET, Delete=delete_payload)
+
+        logger.info(f"[delete_existing_parquets] Deleted {len(objects)} file(s) from s3://{S3_BUCKET}/{prefix}")
+        return len(objects)
+
+    except Exception as e:
+        logger.error(f"[delete_existing_parquets] Failed to delete files at {prefix}: {e}")
+        raise
+
+
+def build_s3_key(date_str: str, chunk_id: int) -> str:
+    """
+    Builds the S3 key for a parquet chunk.
+    Format: <S3_PREFIX>/exchange_date=<date_str>/<YYYYMMDD>_chunk_<id>.parquet
+    Example: exchange-rates/brand=Visa/exchange_date=2026-02-01/20260201_chunk_1.parquet
+    """
+    file_date = datetime.strptime(date_str, DATE_FORMAT_INPUT).strftime(DATE_FORMAT_FILE)
+    return f"{S3_PREFIX}/exchange_date={date_str}/{file_date}_chunk_{chunk_id}.parquet"
+
+
+def save_chunk_to_s3(records: list[dict], date_str: str, chunk_id: int) -> str:
+    """
+    Serializes a list of exchange rate records into a parquet file and uploads it to S3.
+    Skips records with missing fx_rate values.
+    Returns the S3 key of the saved file.
+    """
+    s3_key        = build_s3_key(date_str, chunk_id)
+    valid_records = [r for r in records if r["fx_rate"] != ""]
+    skipped_count = len(records) - len(valid_records)
+
+    if not valid_records:
+        logger.warning(f"[save_chunk_to_s3] chunk_id={chunk_id} | No valid records to save, skipping upload")
+        return s3_key
+
+    try:
+        table = pa.table({
+            "date":          [r["date"]          for r in valid_records],
+            "from_currency": [r["from_currency"] for r in valid_records],
+            "to_currency":   [r["to_currency"]   for r in valid_records],
+            "fx_rate":       [r["fx_rate"]       for r in valid_records],
+        })
+
+        buffer = io.BytesIO()
+        pq.write_table(table, buffer)
+        buffer.seek(0)
+
+        boto3.client("s3").put_object(
+            Bucket=S3_BUCKET,
+            Key=s3_key,
+            Body=buffer.getvalue(),
+            ContentType="application/octet-stream",
+        )
+
+        logger.info(
+            f"[save_chunk_to_s3] chunk_id={chunk_id} | "
+            f"written={len(valid_records)} | skipped={skipped_count} | "
+            f"s3://{S3_BUCKET}/{s3_key}"
+        )
+        return s3_key
+
+    except Exception as e:
+        logger.error(f"[save_chunk_to_s3] chunk_id={chunk_id} | Failed to upload parquet: {e}")
+        raise
 
 # =============================================================================
-# ROL WORKER
+# STEP 1: Scrape exchange rates for a chunk of pairs using Playwright
 # =============================================================================
 
-async def scrape_chunk(fecha: str, pairs: list) -> list[dict]:
-    from playwright.async_api import async_playwright  # import local — no afecta init
+async def scrape_chunk(date: str, pairs: list, chunk_id: int) -> list[dict]:
+    """
+    Uses Playwright to scrape exchange rates for a list of currency pairs.
+    Runs CONCURRENCY async workers consuming a shared queue.
+    """
+    from playwright.async_api import async_playwright
 
     results = []
     queue   = asyncio.Queue()
     total   = len(pairs)
 
-    for idx, pair in enumerate(pairs, 1):
-        await queue.put((idx, pair))
+    for index, pair in enumerate(pairs, 1):
+        await queue.put((index, pair))
+
+    logger.info(f"[scrape_chunk] chunk_id={chunk_id} | Starting scrape | pairs={total}")
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -198,108 +247,205 @@ async def scrape_chunk(fecha: str, pairs: list) -> list[dict]:
             ],
         )
 
-        # Un solo contexto compartido — múltiples contextos con --single-process crashea Chromium
         context = await browser.new_context(
             user_agent=random.choice(USER_AGENTS),
-            extra_http_headers=EXTRA_HEADERS,
+            extra_http_headers=REQUEST_HEADERS,
         )
 
-        async def worker(worker_id: int):
+        async def browser_worker(worker_id: int):
             page = await context.new_page()
 
             while True:
                 try:
-                    idx, pair = queue.get_nowait()
+                    index, pair = queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
 
-                from_curr, to_curr = pair
-                formatted_date     = datetime.strptime(fecha, "%m/%d/%Y").strftime("%Y-%m-%d")
-                url                = VISA_RATES_URL.format(
-                    fecha=fecha, from_curr=from_curr, to_curr=to_curr
+                from_currency, to_currency = pair
+                date_str = datetime.strptime(date, DATE_FORMAT_OUTPUT).strftime(DATE_FORMAT_INPUT)
+                url      = VISA_RATES_URL.format(
+                    date=date,
+                    from_currency=from_currency,
+                    to_currency=to_currency,
                 )
 
                 try:
                     await page.goto(url, wait_until="load", timeout=TIMEOUT_MS)
-                    raw  = await page.inner_text("pre")
-                    data = json.loads(raw)
-                    fx   = data["originalValues"]["fxRateVisa"]
-                    results.append({"date": formatted_date, "fromCurrency": from_curr, "toCurrency": to_curr, "fxRate": fx})
-                    print(f"[W{worker_id}] ✅ [{idx}/{total}] {from_curr}->{to_curr}")
+                    raw     = await page.inner_text("pre")
+                    data    = json.loads(raw)
+                    fx_rate = data["originalValues"]["fxRateVisa"]
 
+                    results.append({
+                        "date":          date_str,
+                        "from_currency": from_currency,
+                        "to_currency":   to_currency,
+                        "fx_rate":       fx_rate,
+                    })
+                    logger.info(f"[scrape_chunk] worker={worker_id} | [{index}/{total}] OK {from_currency}->{to_currency} | fx={fx_rate}")
+
+                except (json.JSONDecodeError, KeyError) as e:
+                    logger.error(f"[scrape_chunk] worker={worker_id} | [{index}/{total}] Failed to parse {from_currency}->{to_currency} | {e}")
+                    results.append({
+                        "date":          date_str,
+                        "from_currency": from_currency,
+                        "to_currency":   to_currency,
+                        "fx_rate":       "",
+                    })
                 except Exception as e:
-                    results.append({"date": formatted_date, "fromCurrency": from_curr, "toCurrency": to_curr, "fxRate": ""})
-                    print(f"[W{worker_id}] ❌ [{idx}/{total}] {from_curr}->{to_curr} | {e}")
+                    logger.error(f"[scrape_chunk] worker={worker_id} | [{index}/{total}] Unexpected error {from_currency}->{to_currency} | {e}")
+                    results.append({
+                        "date":          date_str,
+                        "from_currency": from_currency,
+                        "to_currency":   to_currency,
+                        "fx_rate":       "",
+                    })
 
-                await asyncio.sleep(random.uniform(0.9, 1.3))
+                await asyncio.sleep(random.uniform(0.9, 1.4))
 
             await page.close()
 
-        workers = [asyncio.create_task(worker(i)) for i in range(CONCURRENCIA)]
+        workers = [asyncio.create_task(browser_worker(i)) for i in range(CONCURRENCY)]
         await asyncio.gather(*workers)
         await browser.close()
 
-    print(f"[scrape_chunk] ✅ {len(results)} registros extraídos")
+    written_count = len([r for r in results if r["fx_rate"] != ""])
+    skipped_count = len(results) - written_count
+    logger.info(
+        f"[scrape_chunk] chunk_id={chunk_id} | ========== SUMMARY ========== | "
+        f"total={total} | written={written_count} | skipped={skipped_count} | "
+        f"success_rate={round(written_count / total * 100, 2) if total else 0}%"
+    )
     return results
 
-
-def run_worker(fecha: str, pairs: list, chunk_id: int):
-    print(f"[WORKER {chunk_id}] Iniciando | fecha={fecha} | pares={len(pairs)}")
-
-    records = asyncio.run(scrape_chunk(fecha, pairs))
-
-    #s3  = boto3.client("s3")
-    written, skipped = save_to_dynamodb(records)
-    
-    #written = 0
-    #skipped = 0
-    
-    print(f"[WORKER {chunk_id}] ✅ fecha={fecha} | escritos={written} | omitidos={skipped}")
-    return {
-        "statusCode":   200,
-        "mode":         "worker",
-        "chunk_id":     chunk_id,
-        "records_ok":   written,
-        "records_skip": skipped,
-    }
-    
-    #ts  = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    #key = f"{S3_PREFIX.rstrip('/')}/{fecha}chunk_{chunk_id}_{fecha.replace('/', '-')}_{ts}.json"
-
-    # s3.put_object(
-    #     Bucket=S3_BUCKET,
-    #     Key=key,
-    #     Body=json.dumps(records, ensure_ascii=False),
-    #     ContentType="application/json",
-    # )
-
-    # print(f"[WORKER {chunk_id}] ✅ Guardado en s3://{S3_BUCKET}/{key}/{fecha}")
-    # return {
-    #     "statusCode": 200,
-    #     "mode":       "worker",
-    #     "chunk_id":   chunk_id,
-    #     "records":    len(records),
-    #     "s3_key":     key,
-    # }
-
-
 # =============================================================================
-# HANDLER PRINCIPAL — decide el rol según el evento
+# ORCHESTRATOR
 # =============================================================================
 
-def lambda_handler(event: dict, context):
+def run_orchestrator(begin_date: str, end_date: str) -> dict:
+    """
+    Orchestrator role:
+    - Fetches the full currency pair list from VISA
+    - Deletes existing parquet files for each date before reprocessing
+    - Splits pairs into chunks and invokes one worker Lambda per chunk
+    """
+    logger.info(f"[ORCHESTRATOR] Starting | begin={begin_date} | end={end_date}")
+
+    try:
+        dates  = generate_date_range(begin_date, end_date)
+        pairs  = fetch_currency_list()
+        chunks = split_into_chunks(pairs, NUM_CHUNKS)
+
+        lambda_client = boto3.client("lambda")
+
+        for date in dates:
+            date_str = datetime.strptime(date, DATE_FORMAT_OUTPUT).strftime(DATE_FORMAT_INPUT)
+
+            # Clean up existing parquet files for this date before dispatching workers
+            delete_existing_parquets(date_str)
+
+            logger.info(f"[ORCHESTRATOR] Invoking {NUM_CHUNKS} workers for {date}...")
+
+            for chunk_id, chunk in enumerate(chunks, start=1):
+                try:
+                    payload = {
+                        "mode":     "worker",
+                        "date":     date,
+                        "pairs":    chunk,
+                        "chunk_id": chunk_id,
+                    }
+                    response = lambda_client.invoke(
+                        FunctionName=FUNCTION_NAME,
+                        InvocationType="Event",
+                        Payload=json.dumps(payload),
+                    )
+                    logger.info(
+                        f"[ORCHESTRATOR] Worker {chunk_id} invoked | "
+                        f"{len(chunk)} pairs | status={response['StatusCode']}"
+                    )
+                except Exception as e:
+                    logger.error(f"[ORCHESTRATOR] Failed to invoke worker {chunk_id} for {date}: {e}")
+
+        total_workers = NUM_CHUNKS * len(dates)
+        logger.info(f"[ORCHESTRATOR] Done | {total_workers} workers launched | {len(pairs)} total pairs")
+
+        return {
+            "statusCode":  200,
+            "mode":        "orchestrator",
+            "workers":     total_workers,
+            "total_pairs": len(pairs),
+            "dates":       dates,
+        }
+
+    except Exception as e:
+        logger.error(f"[ORCHESTRATOR] Fatal error: {e}")
+        raise
+
+# =============================================================================
+# WORKER
+# =============================================================================
+
+def run_worker(date: str, pairs: list, chunk_id: int) -> dict:
+    """
+    Worker role:
+    - Scrapes exchange rates for its assigned chunk of currency pairs using Playwright
+    - Saves results as a parquet file in S3
+    """
+    logger.info(f"[WORKER {chunk_id}] Starting | date={date} | pairs={len(pairs)}")
+
+    try:
+        date_str = datetime.strptime(date, DATE_FORMAT_OUTPUT).strftime(DATE_FORMAT_INPUT)
+        records  = asyncio.run(scrape_chunk(date, pairs, chunk_id))
+
+        s3_key        = save_chunk_to_s3(records, date_str, chunk_id)
+        written_count = len([r for r in records if r["fx_rate"] != ""])
+        skipped_count = len(records) - written_count
+
+        logger.info(
+            f"[Worker {chunk_id}] Done | date={date_str} | "
+            f"written={written_count} | skipped={skipped_count} | file={s3_key}"
+        )
+        return {
+            "statusCode":   200,
+            "mode":         "worker",
+            "chunk_id":     chunk_id,
+            "records_ok":   written_count,
+            "records_skip": skipped_count,
+            "s3_key":       s3_key,
+        }
+
+    except Exception as e:
+        logger.error(f"[Worker {chunk_id}] Fatal error | date={date} | {e}")
+        raise
+
+# =============================================================================
+# MAIN HANDLER
+# =============================================================================
+
+def lambda_handler(event: dict, context) -> dict:
+    logger.info(f"[lambda_handler] RAW EVENT: {json.dumps(event)}")
     mode = event.get("mode", "orchestrator")
-    ### En realidad, siempre utiliza el orchestrator, que delegará tareas de worker"
-    if mode == "orchestrator":
-        begin_date = event.get("begin_date", BEGIN_DATE)
-        end_date   = event.get("end_date",   END_DATE)
-        return run_orchestrator(begin_date, end_date)
+    logger.info(f"[lambda_handler] Event received | mode={mode}")
 
-    elif mode == "worker":
-        fecha    = event["fecha"]
-        pairs    = event["pairs"]
-        chunk_id = event.get("chunk_id", 0)
-        return run_worker(fecha, pairs, chunk_id)
+    try:
+        if mode == "orchestrator":
+            begin_date = event.get("begin_date", BEGIN_DATE)
+            end_date   = event.get("end_date",   END_DATE)
+            return run_orchestrator(begin_date, end_date)
 
-    else:
-        raise ValueError(f"Modo desconocido: {mode}. Usar 'orchestrator' o 'worker'.")
+        if mode == "worker":
+            date     = event["date"]
+            pairs    = event["pairs"]
+            chunk_id = event.get("chunk_id", 0)
+            return run_worker(date, pairs, chunk_id)
+
+        raise ValueError(f"Unknown mode: '{mode}'. Use 'orchestrator' or 'worker'.")
+
+    except KeyError as e:
+        logger.error(f"[lambda_handler] Missing required field in event: {e}")
+        raise
+    except ValueError as e:
+        logger.error(f"[lambda_handler] Invalid event value: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"[lambda_handler] Fatal error: {e}")
+        raise

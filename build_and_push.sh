@@ -20,9 +20,9 @@ set -e  # detener el script si cualquier comando falla
 # CONFIGURACIÓN — ajusta estos valores antes de ejecutar
 # =============================================================================
 
-AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --profile mespejo)
 AWS_REGION="eu-south-2"
-ECR_REPO_NAME="itl-0004-itx-dev-rep-visa-xch-rt"
+ECR_REPO_NAME="itl-0004-itx-dev-lambda_layer_visa_exchange_rates"
 IMAGE_TAG="latest"
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
@@ -79,37 +79,43 @@ docker tag \
 echo "🚀 Subiendo imagen a ECR..."
 docker push "${ECR_URI}:${IMAGE_TAG}"
 
-echo ""
-echo "=============================================="
-echo "✅ Imagen subida exitosamente a ECR"
+echo "Imagen subida exitosamente a ECR"
 echo ""
 echo "URI de la imagen para Lambda:"
 echo "${ECR_URI}:${IMAGE_TAG}"
 echo ""
-echo "Próximo paso:"
-echo "  AWS Console → Lambda → Tu función"
-echo "  → 'Image' → 'Deploy new image'"
-echo "  → Pegar el URI de arriba"
-echo "=============================================="
-
 # =============================================================================
-# PASO 5: Actualizar Lambda con la nueva imagen
+# PASO 5: Crear o actualizar Lambda con la nueva imagen
 # =============================================================================
-
-FUNCTION_NAME="visa-exchange-rates-scraper"
-
-echo "🔄 Actualizando Lambda con la nueva imagen..."
-aws lambda update-function-code \
-  --function-name ${FUNCTION_NAME} \
-  --image-uri ${ECR_URI}:${IMAGE_TAG} \
-  --region ${AWS_REGION}
-
+FUNCTION_NAME="itl-0004-itx-dev-visa-exchange-rates"
+LAMBDA_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/itl-0004-itx-dev-visa-exchange-rates-role" 
+echo "Verificando si la función Lambda existe..."
+if aws lambda get-function --function-name ${FUNCTION_NAME} --region ${AWS_REGION} > /dev/null 2>&1; then
+    echo "Función existente — actualizando imagen..."
+    aws lambda update-function-code \
+      --function-name ${FUNCTION_NAME} \
+      --image-uri ${ECR_URI}:${IMAGE_TAG} \
+      --region ${AWS_REGION}
+else
+    echo "Función no existe — creando desde imagen..."
+    aws lambda create-function \
+      --function-name ${FUNCTION_NAME} \
+      --package-type Image \
+      --code ImageUri=${ECR_URI}:${IMAGE_TAG} \
+      --role ${LAMBDA_ROLE_ARN} \
+      --timeout 900 \
+      --memory-size 2048 \
+      --tags coid=itl,apid=itx,assetid=0004,env=dev \
+      --region ${AWS_REGION}
+      
+fi
+ 
 echo "⏳ Esperando que Lambda termine de actualizarse..."
 aws lambda wait function-updated \
   --function-name ${FUNCTION_NAME} \
   --region ${AWS_REGION}
-
+ 
 echo ""
 echo "=============================================="
-echo "✅ Lambda actualizada y lista para probar"
+echo "✅ Lambda lista para probar"
 echo "=============================================="
