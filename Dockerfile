@@ -45,7 +45,7 @@ RUN mkdir -p /ms-playwright && \
 RUN python3 -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); b = p.chromium.launch(); b.close(); p.stop()" || true
 
 # --- Código del handler ---
-COPY lambda_handler.py ${LAMBDA_TASK_ROOT}
+COPY handler.py ${LAMBDA_TASK_ROOT}
 
 # --- Entry point de Lambda ---
-CMD ["lambda_handler.lambda_handler"]
+CMD ["handler.lambda_handler"]
