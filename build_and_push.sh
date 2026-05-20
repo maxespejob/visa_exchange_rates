@@ -22,7 +22,7 @@ set -e  # detener el script si cualquier comando falla
 
 AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --profile mespejo)
 AWS_REGION="eu-south-2"
-ECR_REPO_NAME="itl-0004-itx-dev-lambda_layer_visa_exchange_rates"
+ECR_REPO_NAME=""itl-0004-itx-dev-lambda_layer_visa_exchange_rates
 IMAGE_TAG="latest"
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
@@ -87,7 +87,7 @@ echo ""
 # =============================================================================
 # PASO 5: Crear o actualizar Lambda con la nueva imagen
 # =============================================================================
-FUNCTION_NAME="itl-0004-itx-dev-visa-exchange-rates"
+FUNCTION_NAME="itl-0004-itx-dev-intchg-02-lmbd-vi-exchange-rates"
 LAMBDA_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/itl-0004-itx-dev-visa-exchange-rates-role" 
 echo "Verificando si la función Lambda existe..."
 if aws lambda get-function --function-name ${FUNCTION_NAME} --region ${AWS_REGION} > /dev/null 2>&1; then
